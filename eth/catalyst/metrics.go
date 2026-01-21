@@ -34,4 +34,7 @@ var (
 
 	// Number of times getBlobsV3 responded with some, but not all, blobs
 	getBlobsRequestPartialHit = metrics.NewRegisteredCounter("engine/getblobs/partial", nil)
+
+	// Number of blobs occluded for testing via GETH_BLOBS_OCCLUSION_RANGE
+	getBlobsOccludedCounter = metrics.NewRegisteredCounter("engine/getblobs/occluded", nil)
 )
