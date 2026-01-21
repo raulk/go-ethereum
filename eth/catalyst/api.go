@@ -20,8 +20,11 @@ package catalyst
 import (
 	"errors"
 	"fmt"
+	mrand "math/rand"
+	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +47,35 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 )
+
+// blobOcclusionConfig holds configuration for testing blob occlusion in GetBlobsV3.
+type blobOcclusionConfig struct {
+	enabled bool
+	minPct  int
+	maxPct  int
+}
+
+var blobOcclusion blobOcclusionConfig
+
+func init() {
+	envVal := os.Getenv("GETH_BLOBS_OCCLUSION_RANGE")
+	if envVal == "" {
+		return
+	}
+	parts := strings.Split(envVal, "-")
+	if len(parts) != 2 {
+		log.Warn("Invalid GETH_BLOBS_OCCLUSION_RANGE format", "value", envVal)
+		return
+	}
+	minPct, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	maxPct, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || minPct < 0 || maxPct > 100 || minPct > maxPct {
+		log.Warn("Invalid GETH_BLOBS_OCCLUSION_RANGE bounds", "value", envVal)
+		return
+	}
+	log.Warn("Blob occlusion testing enabled", "range", envVal)
+	blobOcclusion = blobOcclusionConfig{enabled: true, minPct: minPct, maxPct: maxPct}
+}
 
 // Register adds the engine API to the full node.
 func Register(stack *node.Node, backend *eth.Ethereum) error {
@@ -557,6 +589,40 @@ func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProo
 	return api.getBlobs(hashes, true)
 }
 
+// occludeResponse randomly nils out entries in the response for testing.
+func occludeResponse(res []*engine.BlobAndProofV2, cfg blobOcclusionConfig) int {
+	if !cfg.enabled || len(res) == 0 {
+		return 0
+	}
+	var indices []int
+	for i, r := range res {
+		if r != nil {
+			indices = append(indices, i)
+		}
+	}
+	if len(indices) == 0 {
+		return 0
+	}
+	pct := cfg.minPct
+	if cfg.maxPct > cfg.minPct {
+		pct = cfg.minPct + mrand.Intn(cfg.maxPct-cfg.minPct+1)
+	}
+	count := (len(indices) * pct) / 100
+	if count == 0 {
+		return 0
+	}
+	// Fisher-Yates shuffle
+	for i := len(indices) - 1; i > 0; i-- {
+		j := mrand.Intn(i + 1)
+		indices[i], indices[j] = indices[j], indices[i]
+	}
+	for i := 0; i < count; i++ {
+		res[indices[i]] = nil
+	}
+	log.Debug("Occluded blobs for testing", "available", len(indices), "occluded", count, "pct", pct)
+	return count
+}
+
 // GetBlobsV3 returns a set of blobs from the transaction pool. Same as
 // GetBlobsV2, except will return partial responses in case there is a missing
 // blob.
@@ -565,7 +631,15 @@ func (api *ConsensusAPI) GetBlobsV3(hashes []common.Hash) ([]*engine.BlobAndProo
 	if api.config().LatestFork(head.Time) < forks.Osaka {
 		return nil, nil
 	}
-	return api.getBlobs(hashes, false)
+	res, err := api.getBlobs(hashes, false)
+	if err != nil {
+		return nil, err
+	}
+	// Apply blob occlusion for testing (V3 only)
+	if occluded := occludeResponse(res, blobOcclusion); occluded > 0 {
+		getBlobsOccludedCounter.Inc(int64(occluded))
+	}
+	return res, nil
 }
 
 // getBlobs returns all available blobs. In v2, partial responses are not allowed,
